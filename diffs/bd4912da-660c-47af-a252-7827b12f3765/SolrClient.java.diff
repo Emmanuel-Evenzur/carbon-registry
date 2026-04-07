@@ -1,0 +1,1547 @@
+ /*
+ *  Copyright (c) 2005-2015, WSO2 Inc. (http://www.wso2.org) All Rights Reserved.
+ *
+ *  WSO2 Inc. licenses this file to you under the Apache License,
+ *  Version 2.0 (the "License"); you may not use this file except
+ *  in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+ package org.wso2.carbon.registry.indexing.solr;
+ 
+ import com.google.gson.Gson;
+ import org.apache.axis2.context.MessageContext;
+ import org.apache.commons.lang.StringUtils;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.solr.client.solrj.SolrQuery;
+ import org.apache.solr.client.solrj.SolrServerException;
+ import org.apache.solr.client.solrj.embedded.EmbeddedSolrServer;
+ import org.apache.solr.client.solrj.impl.HttpSolrClient;
+ import org.apache.solr.client.solrj.response.FacetField;
+ import org.apache.solr.client.solrj.response.Group;
+ import org.apache.solr.client.solrj.response.GroupCommand;
+ import org.apache.solr.client.solrj.response.QueryResponse;
+ import org.apache.solr.client.solrj.response.UpdateResponse;
+ import org.apache.solr.client.solrj.util.ClientUtils;
+ import org.apache.solr.common.SolrDocument;
+ import org.apache.solr.common.SolrDocumentList;
+ import org.apache.solr.common.SolrException;
+ import org.apache.solr.common.SolrException.ErrorCode;
+ import org.apache.solr.common.SolrInputDocument;
+ import org.apache.solr.core.CoreContainer;
+ import org.apache.solr.core.NodeConfig;
+ import org.wso2.carbon.CarbonConstants;
+ import org.wso2.carbon.base.MultitenantConstants;
+ import org.wso2.carbon.context.PrivilegedCarbonContext;
+ import org.wso2.carbon.registry.core.RegistryConstants;
+ import org.wso2.carbon.registry.core.exceptions.RegistryException;
+ import org.wso2.carbon.registry.core.pagination.PaginationContext;
+ import org.wso2.carbon.registry.core.pagination.PaginationUtils;
+ import org.wso2.carbon.registry.core.session.UserRegistry;
+ import org.wso2.carbon.registry.indexing.AsyncIndexer;
+ import org.wso2.carbon.registry.indexing.IndexingConstants;
+ import org.wso2.carbon.registry.indexing.RegistryConfigLoader;
+ import org.wso2.carbon.registry.indexing.SolrConstants;
+ import org.wso2.carbon.registry.indexing.Utils;
+ import org.wso2.carbon.registry.indexing.indexer.Indexer;
+ import org.wso2.carbon.registry.indexing.indexer.IndexerException;
+ import org.wso2.carbon.registry.indexing.service.RxtUnboundedFieldManagerService;
+ import org.wso2.carbon.user.api.UserRealm;
+ import org.wso2.carbon.user.api.UserStoreException;
+ import org.wso2.carbon.utils.CarbonUtils;
+ 
+ import java.io.File;
+ import java.io.FileOutputStream;
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.io.OutputStream;
+ import java.nio.file.Paths;
+ import java.text.ParseException;
+ import java.text.SimpleDateFormat;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collections;
+ import java.util.Date;
+ import java.util.HashMap;
+ import java.util.Iterator;
+ import java.util.List;
+ import java.util.Locale;
+ import java.util.Map;
+ import java.util.Map.Entry;
+ import java.util.Properties;
+ import java.util.regex.Matcher;
+ import java.util.regex.Pattern;
+ 
+ public class SolrClient {
+ 
+     public static final Log log = LogFactory.getLog(SolrClient.class);
+ 
+     private static volatile SolrClient instance;
+     private org.apache.solr.client.solrj.SolrClient server;
+     private Map<String, String> filePathMap = new HashMap<String, String>();
+     // solr home directory path
+     private static final String SOLR_HOME_FILE_PATH = CarbonUtils.getCarbonConfigDirPath() + File.separator + "solr";
+     private File solrHome, confDir, langDir;
+     private String solrCore = null;
+     private String skipRolesByRegex;
+ 
+     protected SolrClient() throws IOException {
+         // Get the solr server url from the registry.xml
+         RegistryConfigLoader configLoader = RegistryConfigLoader.getInstance();
+         String solrServerUrl = configLoader.getSolrServerUrl();
+         skipRolesByRegex = configLoader.getSkipRolesByRegex();
+ 
+         // Default solr core is set to registry-indexing
+         solrCore = IndexingConstants.DEFAULT_SOLR_SERVER_CORE;
+         if (log.isDebugEnabled()) {
+             log.debug("Solr server core is set as: " + solrCore);
+         }
+ 
+         // Create the solr home path defined in SOLR_HOME_FILE_PATH : carbon_home/repository/conf/solr
+         solrHome = new File(SOLR_HOME_FILE_PATH);
+         if (!solrHome.exists() && !solrHome.mkdirs()) {
+             throw new IOException("Solr home directory could not be created. path: " + solrHome);
+         }
+ 
+         // Create the configuration folder inside solr core : carbon_home/repository/conf/solr/<solrCore>/conf
+         confDir = new File(solrHome, solrCore + File.separator + "conf");
+         if (!confDir.exists() && !confDir.mkdirs()) {
+             throw new IOException("Solr conf directory could not be created! Path: " + confDir);
+         }
+ 
+         // Create lang directory inside conf to store language specific stop words
+         // commons-io --> file utils
+         langDir = new File(confDir, "lang");
+         if (!langDir.exists() && !langDir.mkdirs()) {
+             throw new IOException("Solr lang directory could not be created! Path: " + langDir);
+         }
+ 
+         // Read the configuration file name and there destination path and stored in filePathMap
+         readConfigurationFilePaths();
+         // Read the content of the files in filePathMap and copy them into destination path
+         copyConfigurationFiles();
+         // Set the solr home path
+         System.setProperty(SolrConstants.SOLR_HOME_SYSTEM_PROPERTY, solrHome.getPath());
+ 
+         if (solrServerUrl != null && !solrServerUrl.isEmpty()) {
+             HttpSolrClient.Builder builder = new HttpSolrClient.Builder(solrServerUrl);
+             this.server = builder.build();
+             log.info("Http Solr server initiated at: " + solrServerUrl);
+         } else {
+             NodeConfig nodeConfig = new NodeConfig.NodeConfigBuilder("registry-indexing", Paths.get(solrHome.getPath()))
+                     .build();
+             CoreContainer coreContainer = new CoreContainer(nodeConfig);
+             coreContainer.load();
+             this.server = new EmbeddedSolrServer(coreContainer, solrCore);
+             log.info("Default Embedded Solr Server Initialized");
+         }
+     }
+ 
+     public static SolrClient getInstance() throws IndexerException {
+         if (instance == null) {
+             synchronized (SolrClient.class) {
+                 if (instance == null) {
+                     try {
+                         instance = new SolrClient();
+                     } catch (IOException e) {
+                         log.error("Could not instantiate Solr client", e);
+                         throw new IndexerException("Could not instantiate Solr client", e);
+                     }
+                 }
+             }
+         }
+         return instance;
+     }
+ 
+     /**
+      * Reads sourceFilePath and destFilePath from solr_configuration_files.properties file
+      * e.g: protwords.txt = home/core/conf
+      * protword.txt is the resource file name
+      * home/core/conf is destination file path, this will go to solr-home/<solr-core>/conf directory.
+      * @throws IOException
+      */
+     private void readConfigurationFilePaths() throws IOException {
+         InputStream resourceAsStream = null;
+         try {
+             resourceAsStream = getClass().getClassLoader()
+                     .getResourceAsStream(SolrConstants.SOLR_CONFIG_FILES_CONTAINER);
+             Properties fileProperties = new Properties();
+             fileProperties.load(resourceAsStream);
+ 
+             for (Entry<Object, Object> entry : fileProperties.entrySet()) {
+                 if (entry.getValue() != null) {
+                     String[] fileNames = entry.getValue().toString().split(",");
+                     for (String fileName : fileNames) {
+                         filePathMap.put(fileName, (String) entry.getKey());
+                     }
+                 }
+             }
+         } finally {
+             if (resourceAsStream != null) {
+                 resourceAsStream.close();
+             }
+         }
+     }
+ 
+     /**
+      * Copy solr configuration files in resource folder to solr home folder.
+      * @throws IOException
+      */
+     private void copyConfigurationFiles() throws IOException {
+         for (Entry<String, String> entry : filePathMap.entrySet()) {
+             String sourceFileName = entry.getKey();
+             String fileDestinationPath = entry.getValue();
+             File file;
+ 
+             if (SolrConstants.SOLR_HOME.equals(fileDestinationPath)) {
+                 file = new File(solrHome, sourceFileName);
+             } else if (SolrConstants.SOLR_CORE.equals(fileDestinationPath)) {
+                 file = new File(confDir.getParentFile(), sourceFileName);
+             } else if (SolrConstants.SOLR_CONF_LANG.equals(fileDestinationPath)) {
+                 file = new File(langDir, sourceFileName);
+             } else {
+                 file = new File(confDir, sourceFileName);
+             }
+ 
++            try {
++                String canonicalPath = file.getCanonicalPath();
++                if (!canonicalPath.startsWith(solrHome.getCanonicalPath())) {
++                    continue; // Skip files outside the expected directory
++                }
++            } catch (IOException e) {
++                continue; // Skip files that cause an IOException
++            }
++
+             if (!file.exists()) {
+                 write2File(sourceFileName, file);
+             }
+         }
+     }
+ 
+     private void write2File(String sourceFileName, File dest) throws IOException {
+         byte[] buf = new byte[1024];
+         InputStream in = null;
+         OutputStream out = null;
+         try {
+             in = getClass().getClassLoader().getResourceAsStream(sourceFileName);
+             out = new FileOutputStream(dest);
+ 
+             if (SolrConstants.CORE_PROPERTIES.equals(sourceFileName)) {
+                 Properties coreProperties = new Properties();
+                 coreProperties.load(in);
+                 coreProperties.setProperty("name", solrCore);
+                 coreProperties.store(out, null);
+             } else {
+                 int read;
+                 while ((read = in.read(buf)) >= 0) {
+                     out.write(buf, 0, read);
+                 }
+             }
+ 
+         } finally {
+             if (out != null) {
+                 out.close();
+             }
+             if (in != null) {
+                 in.close();
+             }
+         }
+     }
+ 
+     /**
+      * Delete all solr indexes for specific query
+      *
+      * @param query query that needs to be deleted
+      * @throws SolrException
+      */
+ 
+     public synchronized void deleteIndexByQuery(String query) throws SolrException {
+         try {
+             server.deleteByQuery(query);
+             server.commit();
+         } catch (SolrServerException e) {
+             throw new SolrException(ErrorCode.SERVER_ERROR, "Failure at deleting", e);
+         } catch (IOException e) {
+             throw new SolrException(ErrorCode.SERVER_ERROR, "Failure at deleting", e);
+         }
+     }
+ 
+     /**
+      * Method to generate the solr document id
+      * @param tenantId tenant id
+      * @param path resource path
+      * @return generated document id
+      */
+     private String generateId(int tenantId, String path) {
+         return path + IndexingConstants.FIELD_TENANT_ID + tenantId;
+     }
+ 
+     /**
+      * Method dedicated for add IndexDocument to solr server
+      * @param indexDoc IndexDocument
+      * @throws SolrException
+      */
+     public void addDocument(IndexDocument indexDoc) throws SolrException {
+         try {
+             // Get resource path
+             String path = indexDoc.getPath();
+             // Get resource content
+             String rawContent = indexDoc.getRawContent();
+             // Get resource content as text
+             String contentAsText = indexDoc.getContentAsText();
+             // Get tenant id
+             int tenantId = indexDoc.getTenantId();
+             // Get the attribute fields in the IndexDocument
+             Map<String, List<String>> fields = indexDoc.getFields();
+             // To ease the debugging
+             if (log.isDebugEnabled()) {
+                 log.debug("Indexing Document in resource path: " + path);
+             }
+             SolrInputDocument solrInputDocument = new SolrInputDocument();
+             // Add field id
+             addFieldID(tenantId, path, rawContent, solrInputDocument);
+             // Add field raw content
+             addRawContent(rawContent, solrInputDocument);
+             // Add field tenant id
+             addTenantId(tenantId, solrInputDocument);
+             // Add field content as text
+             addContentAsText(contentAsText, solrInputDocument);
+             // Add advance search related dynamic fields
+             addDynamicFields(fields, solrInputDocument);
+             // Add solr input document to server
+             server.add(solrInputDocument);
+ 
+             if (log.isDebugEnabled()) {
+                 Gson gson = new Gson();
+                 String json = gson.toJson(solrInputDocument);
+                 log.debug("Indexing document content: " + json);
+             }
+         } catch (SolrServerException e) {
+             String message = "Error at indexing.";
+             throw new SolrException(ErrorCode.SERVER_ERROR, message, e);
+         } catch (IOException e) {
+             String message = "Error at indexing.";
+             throw new SolrException(ErrorCode.SERVER_ERROR, message, e);
+         }
+     }
+ 
+     /**
+      * Method for add dynamic fields of the resource
+      * @param fields dynamic fields need to index
+      * @param solrInputDocument Solr InputDocument
+      */
+     private void addDynamicFields(Map<String, List<String>> fields, SolrInputDocument solrInputDocument) {
+         // Add advance search related dynamic fields.
+         if (fields != null && fields.size() > 0) {
+             String fieldKey;
+             for (Map.Entry<String, List<String>> fieldList : fields.entrySet()) {
+                 // Add multivalued attributes.
+                 if (fieldList.getKey().equals(IndexingConstants.FIELD_PROPERTY_VALUES) || fieldList.getKey()
+                         .equals(IndexingConstants.FIELD_ASSOCIATION_DESTINATIONS) || fieldList.getKey()
+                         .equals(IndexingConstants.FIELD_ASSOCIATION_TYPES) || fieldList.getKey()
+                         .equals(IndexingConstants.FIELD_COMMENTS) || fieldList.getKey()
+                         .equals(IndexingConstants.FIELD_TAXONOMY) || fieldList.getKey()
+                         .equals(IndexingConstants.FIELD_TAGS)) {
+                     if (fieldList.getKey().equals(IndexingConstants.FIELD_PROPERTY_VALUES)) {
+                         for (String value : fieldList.getValue()) {
+                             String[] propertyValArray = value.split(",");
+                             fieldKey = propertyValArray[0];
+                             String[] propValues = Arrays.copyOfRange(propertyValArray, 1, propertyValArray.length);
+                             if (propValues.length > 0) {
+                                 addPropertyField(fieldKey, propValues, solrInputDocument);
+                             }
+                         }
+                     } else {
+                         fieldKey = fieldList.getKey() + SolrConstants.SOLR_MULTIVALUED_STRING_FIELD_KEY_SUFFIX;
+                         for (String value : fieldList.getValue()) {
+                             solrInputDocument.addField(fieldKey, value);
+                         }
+                     }
+                 } else if (IndexingConstants.FIELD_ALLOWED_ROLES.equals(fieldList.getKey())) {
+                     //Add allowed roles to predefined index only field
+                     for (String value : fieldList.getValue()) {
+                         solrInputDocument.addField(IndexingConstants.FIELD_ALLOWED_ROLES, value);
+                     }
+                 } else {
+                     // Add date fields
+                     if (fieldList.getKey().equals(IndexingConstants.FIELD_CREATED_DATE) || fieldList.getKey()
+                             .equals(IndexingConstants.FIELD_LAST_UPDATED_DATE)) {
+                         fieldKey = fieldList.getKey() + SolrConstants.SOLR_DATE_FIELD_KEY_SUFFIX;
+                         String date = toSolrDateFormat(fieldList.getValue().get(0), SolrConstants.REG_LOG_DATE_FORMAT);
+                         if (date != null) {
+                             // Add date attributes
+                             solrInputDocument.addField(fieldKey, date);
+                         }
+                     } else {
+                         String fieldKeyValue;
+                         if (fieldList.getKey().equals(IndexingConstants.FIELD_RESOURCE_NAME)) {
+                             fieldKeyValue = IndexingConstants.FIELD_RESOURCE_NAME;
+                         } else {
+                             fieldKeyValue = fieldList.getKey();
+                         }
+ 
+                         String mediaType = null;
+                         List<String> mediaTypeArray = fields.get("mediaType");
+                         if (mediaTypeArray != null && mediaTypeArray.size() > 0) {
+                             mediaType = mediaTypeArray.get(0);
+                         }
+ 
+                         if (fieldList.getValue() != null && mediaType != null && isMultiValueField(mediaType,
+                                 fieldList.getKey())) {
+                             solrInputDocument
+                                     .addField(fieldKeyValue + SolrConstants.SOLR_MULTIVALUED_STRING_FIELD_KEY_SUFFIX,
+                                             fieldList.getValue());
+                         } else {
+                             // Add single field String values
+                             solrInputDocument
+                                     .addField(fieldKeyValue + SolrConstants.SOLR_STRING_FIELD_KEY_SUFFIX,
+                                             fieldList.getValue().get(0));
+                         }
+                     }
+                 }
+             }
+         }
+     }
+ 
+     /**
+      * Method to add property values
+      * @param fieldKey property field key value
+      * @param values property field value
+      * @param solrInputDocument Solr InputDocument
+      */
+     private void addPropertyField(String fieldKey, String[] values, SolrInputDocument solrInputDocument) {
+         int intValue;
+         double doubleValue;
+         // Check whether the value is an Int or decimal or string
+         String valueType = getType(values[0]);
+         for (String propValue : values) {
+             switch (valueType) {
+                 case SolrConstants.TYPE_INT:
+                     try {
+                         intValue = Integer.parseInt(propValue);
+                         solrInputDocument.addField(fieldKey + SolrConstants.SOLR_MULTIVALUED_INT_FIELD_KEY_SUFFIX,
+                                 intValue);
+                     } catch (NumberFormatException e) {
+                         log.debug("Number format error when parsing the value, Hence indexing as string value. " +
+                                 "Field: " + fieldKey);
+                         solrInputDocument.addField(fieldKey + SolrConstants.SOLR_MULTIVALUED_STRING_FIELD_KEY_SUFFIX,
+                                 propValue);
+                     }
+                     break;
+                 case SolrConstants.TYPE_DOUBLE:
+                     try {
+                         doubleValue = Double.parseDouble(propValue);
+                         solrInputDocument.addField(fieldKey + SolrConstants.SOLR_MULTIVALUED_DOUBLE_FIELD_KEY_SUFFIX,
+                                 doubleValue);
+                     } catch (NumberFormatException e) {
+                         log.debug("Number format error when parsing the value, Hence indexing as string value. " +
+                                 "Field: " + fieldKey);
+                         solrInputDocument.addField(fieldKey + SolrConstants.SOLR_MULTIVALUED_STRING_FIELD_KEY_SUFFIX,
+                                 propValue);
+                     }
+                     break;
+                 case SolrConstants.TYPE_STRING:
+                     solrInputDocument.addField(fieldKey + SolrConstants.SOLR_MULTIVALUED_STRING_FIELD_KEY_SUFFIX, propValue);
+                     break;
+             }
+         }
+     }
+ 
+     /**
+      * Method to identify the type of the given string. Match a number with optional '-' and decimal.
+      * @param value String value
+      * @return type of the value
+      */
+     private String getType(String value) {
+         String type;
+         Matcher intMatcher = SolrConstants.INT_PATTERN.matcher(value);
+         Matcher doubleMatcher = SolrConstants.DOUBLE_PATTERN.matcher(value);
+         if (intMatcher.matches()) {
+             type = SolrConstants.TYPE_INT;
+         } else if (doubleMatcher.matches()) {
+             type = SolrConstants.TYPE_DOUBLE;
+         } else {
+             type = SolrConstants.TYPE_STRING;
+         }
+         return type;
+     }
+ 
+     /**
+      * Method for add content of the resource
+      * @param contentAsText content of the resource
+      * @param solrInputDocument Solr InputDocument
+      */
+     private void addContentAsText(String contentAsText, SolrInputDocument solrInputDocument) {
+         if (contentAsText != null && contentAsText.length() > 0) {
+             solrInputDocument.addField(IndexingConstants.FIELD_CONTENT_ONLY, contentAsText);
+         }
+     }
+ 
+     /**
+      * Method for add tenant id of the resource
+      * @param tenantId tenant id
+      * @param solrInputDocument Solr InputDocument
+      */
+     private void addTenantId(int tenantId, SolrInputDocument solrInputDocument) {
+         solrInputDocument.addField(IndexingConstants.FIELD_TENANT_ID, String.valueOf(tenantId));
+     }
+ 
+     /**
+      * Method for add raw content of the resource
+      * @param rawContent raw content
+      * @param solrInputDocument Solr InputDocument
+      */
+     private void addRawContent(String rawContent, SolrInputDocument solrInputDocument) {
+         if (rawContent != null && StringUtils.isNotEmpty(rawContent)) {
+             solrInputDocument.addField(IndexingConstants.FIELD_TEXT, rawContent);
+         }
+     }
+ 
+     /**
+      * Method for add Solr document id
+      * @param tenantId tenant id
+      * @param path resource path
+      * @param rawContent raw content
+      * @param solrInputDocument solr InputDocument
+      */
+     private void addFieldID(int tenantId, String path, String rawContent, SolrInputDocument solrInputDocument) {
+         // Generate the solr Document id
+         String id = generateId(tenantId, path);
+         if (id == null) {
+             id = IndexingConstants.FIELD_ID + rawContent.hashCode();
+         }
+         solrInputDocument.addField(IndexingConstants.FIELD_ID, id);
+     }
+ 
+     /**
+      * Method to get Solr generic date formatter
+      * @param dateStr date value
+      * @param currentFormat date format
+      * @return solr date format
+      */
+     private String toSolrDateFormat(String dateStr, String currentFormat) {
+         String solrDateFormatResult = null;
+         try {
+             SimpleDateFormat sdf = new SimpleDateFormat(currentFormat, Locale.ENGLISH);
+             Date date = sdf.parse(dateStr);
+             sdf.applyPattern(SolrConstants.SOLR_DATE_FORMAT);
+             solrDateFormatResult = sdf.format(date);
+         } catch (ParseException e) {
+             log.error("Error when passing date to create solr date format." + e);
+         }
+         return solrDateFormatResult;
+     }
+ 
+     public void indexDocument(AsyncIndexer.File2Index fileData, Indexer indexer) throws RegistryException {
+         IndexDocument doc = indexer.getIndexedDocument(fileData);
+         doc.setTenantId(fileData.tenantId);
+         addDocument(doc);
+     }
+ 
+     public synchronized void deleteFromIndex(String path, int tenantId) throws SolrException {
+         try {
+             String id = generateId(tenantId, path);
+             server.deleteById(id);
+             if (log.isDebugEnabled()) {
+                 log.debug("Solr delete index path: " + path + " id: " + id);
+             }
+         } catch (SolrServerException e) {
+             // Throw unchecked exception: SolrException, this will throw when there is an error in connection.
+             throw new SolrException(ErrorCode.SERVER_ERROR, "Failure at deleting", e);
+         } catch (IOException e) {
+             // Throw unchecked exception: SolrException, this will throw when there is an error in connection.
+             throw new SolrException(ErrorCode.SERVER_ERROR, "Failure at deleting", e);
+         }
+     }
+ 
+     public SolrDocumentList query(String keywords, int tenantId) throws SolrException {
+         return query(keywords, tenantId, Collections.<String, String>emptyMap());
+     }
+ 
+     public SolrDocumentList query(int tenantId, Map<String, String> fields) throws SolrException {
+         return query("[* TO *]", tenantId, fields);
+     }
+     
+     public SolrDocumentList query(String keywords, Map<String, String> fields, int tenantId) throws SolrException {
+         return query(keywords, tenantId, fields);
+     }
+ 
+     /**
+      * Method to create the solr query for indexing.
+      * @param keywords content search keyword.
+      * @param tenantId tenant id.
+      * @param fields Dynamic fields attribute list.
+      * @return query response result.
+      * @throws SolrException
+      */
+     public SolrDocumentList query(String keywords, int tenantId, Map<String, String> fields) throws SolrException {
+         try {
+             SolrQuery query;
+             // Get the attribute value for content
+             String contentAttribute = fields.get(IndexingConstants.FIELD_CONTENT);
+             if (contentAttribute != null && StringUtils.isNotEmpty(contentAttribute)) {
+                 if (getCharCount(contentAttribute, '"') > 0) {
+                     query = new SolrQuery(contentAttribute);
+                 } else {
+                     // Check for '&&' and replace with AND, Check for ' ' and replace with OR
+                     query = new SolrQuery(contentAttribute.replaceAll(" ", " OR ").replaceAll("&&", " AND "));
+                 }
+                 fields.remove(IndexingConstants.FIELD_CONTENT);
+             } else if (keywords.equals("[* TO *]")) {
+                 query = new SolrQuery("* TO *");
+             } else if (keywords.contains("q=") && keywords.contains("fq=")){
+                 String q = null;
+                 List<String> fqList = new ArrayList<String>();
+                 String[] splitQueryArray = keywords.split("&");
+                 for (int i = 0; i < splitQueryArray.length; i++) {
+                     String splitQuery = splitQueryArray[i];
+                     String[] extractedQuery = splitQuery.split("=");
+                     if ("q".equals(extractedQuery[0])) {
+                         q = extractedQuery[1];
+                     } else if ("fq".equals(extractedQuery[0])) {
+                         fqList.add(extractedQuery[1]);
+                     }
+                 }
+                 query = new SolrQuery(q);
+                 for (String fq : fqList) {
+                     query.addFilterQuery(fq);
+                 }
+             } else {
+                 //convert the search query to solr readable fields
+                 String solrQuery = convertFieldNames(keywords);
+                 query = new SolrQuery(solrQuery);
+             }
+ 
+             // Set no of rows
+             query.setRows(Integer.MAX_VALUE);
+             // Solr does not allow to search with special characters ,therefore this fix allow
+             // to contain "-" in super tenant id.
+             if (tenantId == MultitenantConstants.SUPER_TENANT_ID) {
+                 query.addFilterQuery(IndexingConstants.FIELD_TENANT_ID + ":" + "\\" + tenantId);
+             } else {
+                 query.addFilterQuery(IndexingConstants.FIELD_TENANT_ID + ":" + tenantId);
+             }
+             if (fields.get(IndexingConstants.FIELD_MEDIA_TYPE) != null) {
+                 // This is for fixing  REGISTRY-1695, This is temporary solution until
+                 // the default security polices also stored in Governance registry.
+                 if (fields.get(IndexingConstants.FIELD_MEDIA_TYPE).equals(
+                         RegistryConstants.POLICY_MEDIA_TYPE) ||
+                         fields.get(IndexingConstants.FIELD_MEDIA_TYPE).equals(
+                                 RegistryConstants.WSDL_MEDIA_TYPE)) {
+                     query.addFilterQuery(IndexingConstants.FIELD_ID + ":" +
+                             SolrConstants.GOVERNANCE_REGISTRY_BASE_PATH + "*");
+                 }
+             }
+             // add filter query for user role filtering
+             addUserRoleFilter(tenantId, query);
+             // Add query filters
+             addQueryFilters(fields, query);
+             QueryResponse queryresponse;
+             MessageContext messageContext = MessageContext.getCurrentMessageContext();
+             if ((messageContext != null && PaginationUtils.isPaginationHeadersExist(messageContext))
+                     || PaginationContext.getInstance() != null) {
+                 try {
+                     PaginationContext paginationContext;
+                     if (messageContext != null) {
+                         paginationContext = PaginationUtils.initPaginationContext(messageContext);
+                     } else {
+                         paginationContext = PaginationContext.getInstance();
+                     }
+                     if (log.isDebugEnabled()) {
+                         log.debug("Pagination Context| start: "+paginationContext.getStart()+" | rows:" +
+                                 paginationContext.getCount()+" | sortBy: "+paginationContext.getSortBy());
+                     }
+                     //setting up start and row count for pagination
+                     query.setStart(paginationContext.getStart());
+                     query.setRows(paginationContext.getCount());
+ 
+                     String sortBy = paginationContext.getSortBy();
+                     if (IndexingConstants.META_CREATED_DATE.equals(sortBy)) {
+                         sortBy = IndexingConstants.FIELD_CREATED_DATE;
+                     } else if (IndexingConstants.META_LAST_UPDATED_DATE.equals(sortBy)) {
+                         sortBy = IndexingConstants.FIELD_LAST_UPDATED_DATE;
+                     }
+                     if (sortBy.length() > 0) {
+                         String sortOrder = paginationContext.getSortOrder();
+                         addSortByQuery(query, sortBy, sortOrder);
+                     }
+                     queryresponse = server.query(query);
+                     if (log.isDebugEnabled()) {
+                         log.debug("Solr index queried query: " + query);
+                     }
+                     //setting up result count in the paginationContext
+                     if (messageContext != null) {
+                         PaginationUtils.setRowCount(messageContext,
+                                 Long.toString(queryresponse.getResults().getNumFound()));
+                     } else {
+                         if (null != queryresponse.getResults()) {
+                             paginationContext.setLength((int) queryresponse.getResults().getNumFound());
+                         } else if (queryresponse.getGroupResponse() != null && queryresponse.getGroupResponse().getValues().size() > 0) {
+                             for (GroupCommand groupCmd : queryresponse.getGroupResponse().getValues()) {
+                                 paginationContext.setLength(groupCmd.getNGroups());
+                                 SolrDocumentList solrDocumentsList = new SolrDocumentList();
+                                 for (Group group : groupCmd.getValues()) { //This loop traverses through each group
+                                     solrDocumentsList.addAll(group.getResult());
+                                 }
+                                 return solrDocumentsList;
+                             }
+                         }
+                     }
+                 } finally {
+                     if (messageContext != null) {
+                         PaginationContext.destroy();
+                     }
+                 }
+             } else {
+                 queryresponse = server.query(query);
+                 if (log.isDebugEnabled()) {
+                     log.debug("Solr index queried query: " + query);
+                 }
+             }
+             return queryresponse.getResults();
+         } catch (SolrServerException | IOException e) {
+             String message = "Failure at query ";
+             throw new SolrException(ErrorCode.SERVER_ERROR, message + keywords, e);
+         }
+     }
+ 
+     /**
+      * This method will return solr readable query String for the keywords
+      *
+      * @param keywords search query string
+      * @return solr aware string
+      */
+     private String convertFieldNames(String keywords) {
+         Pattern p = Pattern.compile("([^-\\s -()]*?):");
+         Matcher m = p.matcher(keywords);
+         while (m.find()) {
+             String fieldName = m.group(1);
+             if (IndexingConstants.FIELD_TAGS.equals(fieldName) ||
+                     IndexingConstants.FIELD_TAXONOMY.equals(fieldName) ||
+                     IndexingConstants.FIELD_COMMENTS.equals(fieldName) ||
+                     IndexingConstants.FIELD_ASSOCIATION_DESTINATIONS.equals(fieldName) ||
+                     IndexingConstants.FIELD_ASSOCIATION_TYPES.equals(fieldName)) {
+                 keywords = replaceKeyword(keywords, fieldName, SolrConstants.SOLR_MULTIVALUED_STRING_FIELD_KEY_SUFFIX);
+             } else if (IndexingConstants.FIELD_CREATED_DATE.equals(fieldName) ||
+                     IndexingConstants.FIELD_LAST_UPDATED_DATE.equals(fieldName)) {
+                 keywords = replaceKeyword(keywords, fieldName, SolrConstants.SOLR_DATE_FIELD_KEY_SUFFIX);
+             } else if (IndexingConstants.FIELD_LC_NAME.equals(fieldName) ||
+                     IndexingConstants.FIELD_LC_STATE.equals(fieldName) ||
+                     IndexingConstants.FIELD_AUTHOR.equals(fieldName) ||
+                     IndexingConstants.FIELD_MEDIA_TYPE.equals(fieldName) ||
+                     IndexingConstants.FIELD_UPDATER.equals(fieldName)) {
+                 keywords = replaceKeyword(keywords, fieldName, SolrConstants.SOLR_STRING_FIELD_KEY_SUFFIX);
+             } else if (IndexingConstants.FIELD_CONTENT.equals(fieldName)) {
+                 keywords = keywords.replace(IndexingConstants.FIELD_CONTENT + ":", "");
+             } else if (!fieldName.contains("_")) {
+                 keywords = replaceKeyword(keywords, fieldName, SolrConstants.SOLR_MULTIVALUED_STRING_FIELD_KEY_SUFFIX);
+             } else {
+                 keywords = replaceKeyword(keywords, fieldName, SolrConstants.SOLR_STRING_FIELD_KEY_SUFFIX);
+             }
+         }
+         log.debug("Solr Query Search | Search Query:::: " + keywords);
+         return keywords;
+     }
+ 
+     private String replaceKeyword(String keyword, String fieldName, String suffix) {
+         int count = StringUtils.countMatches(keyword, fieldName);
+         if (count > 1) {
+             keyword = keyword.replace(fieldName, fieldName + suffix);
+             keyword = keyword.replace(IndexingConstants.OVERVIEW_CONSTANT + "_" + fieldName + suffix, IndexingConstants.OVERVIEW_CONSTANT + "_" + fieldName);
+         } else {
+             keyword = keyword.replace(fieldName, fieldName + suffix);
+         }
+         return keyword;
+     }
+ 
+     /**
+      * This method will return how many occurrences of key there in the str string
+      *
+      * @param str The string
+      * @param key The flag
+      * @return The amount of occurrences
+      */
+     private int getCharCount(String str, char key) {
+         int counter = 0;
+         for (int i = 0; i < str.length(); i++) {
+             if (str.charAt(i) == key) {
+                 counter++;
+             }
+         }
+         return counter;
+     }
+ 
+     /**
+      * Method build the filter query to filter the results by the user role
+      * @param tenantId tenantID of the logged user
+      * @param query search query
+      */
+     private void addUserRoleFilter(int tenantId, SolrQuery query) throws SolrException {
+         try {
+             UserRegistry registry = Utils.getRegistryService().getRegistry(CarbonConstants.REGISTRY_SYSTEM_USERNAME, tenantId);
+             UserRealm realm = registry.getUserRealm();
+             String userName = getLoggedInUserName();
+             if (userName == null) {
+                 userName = CarbonConstants.REGISTRY_ANONNYMOUS_USERNAME;
+             }
+ 
+             String[] userRoles = realm.getUserStoreManager().getRoleListOfUser(userName);
+ 
+             if (skipRolesByRegex != null) {
+                 List<String> filteredUserRoles = new ArrayList<>(Arrays.asList(userRoles));
+                 String[] regexList = skipRolesByRegex.split(",");
+                 for (int i = 0; i < regexList.length; i++) {
+                     Pattern p = Pattern.compile(regexList[i]);
+                     Iterator<String> itr = filteredUserRoles.iterator();
+                     while(itr.hasNext()) {
+                         String role = itr.next();
+                         Matcher m = p.matcher(role);
+                         if (m.matches()) {
+                             itr.remove();
+                         }
+                     }
+                 }
+                 userRoles = filteredUserRoles.toArray(new String[0]);
+             }
+ 
+             StringBuilder rolesQuery = new StringBuilder();
+             for (String userRole : userRoles) {
+                 if (rolesQuery.length() == 0) {
+                     rolesQuery.append('(');
+                     rolesQuery.append(ClientUtils.escapeQueryChars(userRole.toLowerCase()));
+                 } else {
+                     rolesQuery.append(" OR ");
+                     rolesQuery.append(ClientUtils.escapeQueryChars(userRole.toLowerCase()));
+                 }
+             }
+             rolesQuery.append(')');
+             String queryValue = rolesQuery.toString();
+             if (log.isDebugEnabled()) {
+                 log.debug("user roles filter query values: " +queryValue);
+             }
+             query.addFilterQuery(IndexingConstants.FIELD_ALLOWED_ROLES + ':' + queryValue);
+         } catch (RegistryException | UserStoreException e) {
+             throw new SolrException(ErrorCode.BAD_REQUEST, "Error while creating user role filter query", e);
+         }
+     }
+ 
+     private void addSortByQuery(SolrQuery query, String sortBy, String sortOrder) {
+         if (IndexingConstants.FIELD_TAGS.equals(sortBy) ||
+                 IndexingConstants.FIELD_COMMENTS.equals(sortBy) ||
+                 IndexingConstants.FIELD_ASSOCIATION_DESTINATIONS.equals(sortBy) ||
+                 IndexingConstants.FIELD_TAXONOMY.equals(sortBy) ||
+                 IndexingConstants.FIELD_ASSOCIATION_TYPES.equals(sortBy)) {
+             log.error("Sorting in multivalued fields is not supported");
+         } else if (IndexingConstants.FIELD_CREATED_DATE.equals(sortBy) ||
+                 IndexingConstants.FIELD_LAST_UPDATED_DATE.equals(sortBy)) {
+             query.setSort(sortBy + SolrConstants.SOLR_DATE_FIELD_KEY_SUFFIX,
+                     "ASC".equals(sortOrder) ? SolrQuery.ORDER.asc : SolrQuery.ORDER.desc);
+         } else {
+             query.setSort(sortBy + SolrConstants.SOLR_STRING_FIELD_KEY_SUFFIX,
+                     "ASC".equals(sortOrder) ? SolrQuery.ORDER.asc : SolrQuery.ORDER.desc);
+         }
+     }
+ 
+     private void addGroupingQuery(SolrQuery query, String groupKey, String groupVal) {
+ 
+         if (IndexingConstants.FIELD_GROUP.equals(groupKey) ||
+                 IndexingConstants.FIELD_GROUP_FIELD.equals(groupKey) ||
+                 IndexingConstants.FIELD_GROUP_SORT.equals(groupKey) ||
+                 IndexingConstants.FIELD_GROUP_NGROUPS.equals(groupKey) ||
+                 IndexingConstants.FIELD_GROUP_FORMAT.equals(groupKey)
+         ) {
+             query.set(groupKey, groupVal);
+         }
+     }
+     public List<FacetField.Count> facetQuery(String keywords, String facetField, int tenantId) throws SolrException {
+         Map<String, String> fields = new HashMap<>();
+         fields.put(IndexingConstants.FACET_FIELD_NAME, facetField);
+         return facetQuery(keywords, tenantId, fields);
+     }
+ 
+     public List<FacetField.Count> facetQuery(int tenantId, Map<String, String> fields) throws SolrException {
+         return facetQuery("[* TO *]", tenantId, fields);
+     }
+ 
+     public List<FacetField.Count> facetQuery(String keywords, int tenantId, Map<String, String> fields) throws SolrException {
+         List<FacetField.Count> fieldsList = new ArrayList<>();
+         String facetField = null;
+         try {
+             SolrQuery query;
+             // Get the attribute value for content
+             String contentAttribute = fields.get(IndexingConstants.FIELD_CONTENT);
+             if (contentAttribute != null && StringUtils.isNotEmpty(contentAttribute)) {
+                 if (getCharCount(contentAttribute, '"') > 0) {
+                     query = new SolrQuery(contentAttribute);
+                 } else {
+                     // Check for '&&' and replace with AND, Check for ' ' and replace with OR
+                     query = new SolrQuery(contentAttribute.replaceAll(" ", " OR ").replaceAll("&&", " AND "));
+                 }
+                 fields.remove(IndexingConstants.FIELD_CONTENT);
+             } else if (keywords.equals("[* TO *]")) {
+                 query = new SolrQuery("* TO *");
+             } else {
+                 //convert the search query to solr readable fields
+                 String solrQuery = convertFieldNames(keywords);
+                 query = new SolrQuery(solrQuery);
+             }
+             // Set no of rows
+             query.setRows(Integer.MAX_VALUE);
+             // Solr does not allow to search with special characters ,therefore this fix allow
+             // to contain "-" in super tenant id.
+             if (tenantId == MultitenantConstants.SUPER_TENANT_ID) {
+                 query.addFilterQuery(IndexingConstants.FIELD_TENANT_ID + ':' + "\\" + tenantId);
+             } else {
+                 query.addFilterQuery(IndexingConstants.FIELD_TENANT_ID + ':' + tenantId);
+             }
+             if (fields.get(IndexingConstants.FIELD_MEDIA_TYPE) != null) {
+                 // This is for fixing  REGISTRY-1695, This is temporary solution until
+                 // the default security polices also stored in Governance registry.
+                 if (fields.get(IndexingConstants.FIELD_MEDIA_TYPE).equals(
+                         RegistryConstants.POLICY_MEDIA_TYPE) ||
+                         fields.get(IndexingConstants.FIELD_MEDIA_TYPE).equals(
+                                 RegistryConstants.WSDL_MEDIA_TYPE)) {
+                     query.addFilterQuery(IndexingConstants.FIELD_ID + ':' +
+                             SolrConstants.GOVERNANCE_REGISTRY_BASE_PATH + '*');
+                 }
+             }
+             // Add facet fields
+             facetField = addFacetFields(fields, query);
+             // add filter query for user role filtering
+             addUserRoleFilter(tenantId, query);
+             // Add query filters
+             addQueryFilters(fields, query);
+             if (log.isDebugEnabled()) {
+                 log.debug("Solr search faceted query: " + query);
+             }
+             QueryResponse queryresponse;
+             MessageContext messageContext = MessageContext.getCurrentMessageContext();
+             if ((messageContext != null && PaginationUtils.isPaginationHeadersExist(messageContext))
+                     || PaginationContext.getInstance() != null) {
+                 try {
+                     PaginationContext paginationContext;
+                     if (messageContext != null) {
+                         paginationContext = PaginationUtils.initPaginationContext(messageContext);
+                     } else {
+                         paginationContext = PaginationContext.getInstance();
+                     }
+                     if (log.isDebugEnabled()) {
+                         log.debug("Pagination Context| start: " + paginationContext.getStart() + " | rows:" +
+                                 paginationContext.getCount() + " | sortBy: " + paginationContext.getSortBy());
+                     }
+                     //setting up start and row count for pagination
+                     query.setStart(paginationContext.getStart());
+                     query.setRows(paginationContext.getCount());
+ 
+                     queryresponse = server.query(query);
+ 
+                     //setting up result count in the paginationContext
+                     if (messageContext != null) {
+                         PaginationUtils.setRowCount(messageContext,
+                                 Long.toString(queryresponse.getResults().getNumFound()));
+                     } else {
+                         paginationContext.setLength((int) queryresponse.getResults().getNumFound());
+                     }
+                 } finally {
+                     if (messageContext != null) {
+                         PaginationContext.destroy();
+                     }
+                 }
+             } else {
+                 queryresponse = server.query(query);
+                 if (log.isDebugEnabled()) {
+                     log.debug("Solr index queried query: " + query);
+                 }
+             }
+             if (queryresponse.getFacetField(facetField) != null) {
+                 fieldsList = queryresponse.getFacetField(facetField).getValues();
+             }
+             return fieldsList;
+ 
+         } catch (SolrServerException | IOException e) {
+             String message = "Failure at query ";
+             throw new SolrException(ErrorCode.SERVER_ERROR, message + facetField, e);
+         }
+     }
+ 
+     private String addFacetFields(Map<String, String> fields, SolrQuery query) {
+         //set the facet true to enable facet
+         //Need to set the Facet to true to enable Facet Query.
+         query.setFacet(true);
+         String fieldName = fields.get(IndexingConstants.FACET_FIELD_NAME);
+         String queryField = null;
+         if (fieldName != null) {
+             //set the field for the facet
+             if (IndexingConstants.FIELD_TAGS.equals(fieldName) ||
+                     IndexingConstants.FIELD_TAXONOMY.equals(fieldName) ||
+                     IndexingConstants.FIELD_COMMENTS.equals(fieldName) ||
+                     IndexingConstants.FIELD_ASSOCIATION_DESTINATIONS.equals(fieldName) ||
+                     IndexingConstants.FIELD_ASSOCIATION_TYPES.equals(fieldName)) {
+                 queryField = fieldName + SolrConstants.SOLR_MULTIVALUED_STRING_FIELD_KEY_SUFFIX;
+                 query.addFacetField(queryField);
+             } else {
+                 queryField = fieldName + SolrConstants.SOLR_STRING_FIELD_KEY_SUFFIX;
+                 query.addFacetField(queryField);
+             }
+             //remove the facet field avoid affecting to query results
+             fields.remove(IndexingConstants.FACET_FIELD_NAME);
+             //set the limit for the facet
+             if (fields.get(IndexingConstants.FACET_LIMIT) != null) {
+                 query.setFacetLimit(Integer.parseInt(fields.get(IndexingConstants.FACET_LIMIT)));
+                 fields.remove(IndexingConstants.FACET_LIMIT);
+             } else {
+                 query.setFacetLimit(IndexingConstants.FACET_LIMIT_DEFAULT);
+             }
+             //set the min count for the facet
+             if (fields.get(IndexingConstants.FACET_MIN_COUNT) != null) {
+                 query.setFacetMinCount(Integer.parseInt(fields.get(IndexingConstants.FACET_MIN_COUNT)));
+                 fields.remove(IndexingConstants.FACET_MIN_COUNT);
+             } else {
+                 query.setFacetMinCount(IndexingConstants.FACET_MIN_COUNT_DEFAULT);
+             }
+             //set the sort value for facet: possible values : index or count
+             if (fields.get(IndexingConstants.FACET_SORT) != null) {
+                 query.setFacetSort(fields.get(IndexingConstants.FACET_SORT));
+                 fields.remove(IndexingConstants.FACET_SORT);
+             }
+             // set the prefix value for facet
+             if (fields.get(IndexingConstants.FACET_PREFIX) != null) {
+                 query.setFacetPrefix(fields.get(IndexingConstants.FACET_PREFIX));
+                 fields.remove(IndexingConstants.FACET_PREFIX);
+             }
+         }
+         return queryField;
+     }
+ 
+     /**
+      * Method to add filters to the solr query
+      * @param fields dynamic fields
+      * @param query solr query
+      */
+     private void addQueryFilters(Map<String, String> fields, SolrQuery query) {
+         String fieldKeySuffix;
+         if (fields.size() > 0) {
+             String propertyName = "", leftPropertyValue = "", rightPropertyValue = "", leftOp = "", rightOp = "",
+                     createdBefore = "", createdAfter = "", updatedBefore = "", updatedAfter = "", mediaType = "",
+                     mediaTypeNegate = "", createdBy = "", createdByNegate = "", updatedBy = "", updatedByNegate = "",
+                     createdRangeNegate = "", updatedRangeNegate = "", resourceName = "", group = "", groupNGroups = "",
+                     groupField = "", groupSort = "", groupFormat = "";
+             for (Map.Entry<String, String> field : fields.entrySet()) {
+                 // Query for multivalued fields
+                 if (field.getValue() != null && StringUtils.isNotEmpty(field.getValue())) {
+                     if (field.getKey().equals(IndexingConstants.FIELD_TAGS) || field.getKey()
+                             .equals(IndexingConstants.FIELD_TAXONOMY) || field.getKey()
+                             .equals(IndexingConstants.FIELD_COMMENTS) || field.getKey()
+                             .equals(IndexingConstants.FIELD_ASSOCIATION_DESTINATIONS) || field.getKey()
+                             .equals(IndexingConstants.FIELD_ASSOCIATION_TYPES)) {
+                         // Set the suffix value of the key
+                         fieldKeySuffix = SolrConstants.SOLR_MULTIVALUED_STRING_FIELD_KEY_SUFFIX + ":";
+                         if (IndexingConstants.FIELD_ASSOCIATION_DESTINATIONS.equals(field.getKey())) {
+                             query.addFilterQuery(
+                                     field.getKey() + fieldKeySuffix + "\"" + field.getValue() + "\"");
+                         } else {
+                             query.addFilterQuery(
+                                     field.getKey() + fieldKeySuffix + field.getValue());
+                         }
+                     } else if (IndexingConstants.FIELD_PROPERTY_NAME.equals(field.getKey())) {
+                         // Get the value of property name
+                         propertyName = field.getValue();
+                     } else if (IndexingConstants.FIELD_LEFT_PROPERTY_VAL.equals(field.getKey())) {
+                         // Get the value of left property value
+                         leftPropertyValue = field.getValue();
+                     } else if (IndexingConstants.FIELD_RIGHT_PROPERTY_VAL.equals(field.getKey())) {
+                         // Get the value of right property value
+                         rightPropertyValue = field.getValue();
+                     } else if (IndexingConstants.FIELD_LEFT_OP.equals(field.getKey())) {
+                         // Get the value of left operation
+                         leftOp = field.getValue();
+                     } else if (IndexingConstants.FIELD_RIGHT_OP.equals(field.getKey())) {
+                         // Get the value of right operation
+                         rightOp = field.getValue();
+                     } else if (IndexingConstants.FIELD_CREATED_BEFORE.equals(field.getKey())) {
+                         // Get the value of created before date
+                         createdBefore = removeSpecialCharacters(field.getValue());
+                     } else if (IndexingConstants.FIELD_CREATED_AFTER.equals(field.getKey())) {
+                         // Get the value of created after date
+                         createdAfter = removeSpecialCharacters(field.getValue());
+                     } else if (IndexingConstants.FIELD_UPDATED_BEFORE.equals(field.getKey())) {
+                         // Get the value of update before date
+                         updatedBefore = removeSpecialCharacters(field.getValue());
+                     } else if (IndexingConstants.FIELD_UPDATED_AFTER.equals(field.getKey())) {
+                         // Get the value of updated after date
+                         updatedAfter = removeSpecialCharacters(field.getValue());
+                     } else if (IndexingConstants.FIELD_RESOURCE_NAME.equals(field.getKey())) {
+                         // Set the suffix value of the key
+                         resourceName = field.getValue();
+                         if(resourceName.contains(" ")) {
+                             resourceName = "\"" + resourceName + "\"";
+                         }
+                     } else if (IndexingConstants.FIELD_MEDIA_TYPE.equals(field.getKey())) {
+                         // Get the value of resource mediaType
+                         mediaType = field.getValue();
+                     } else if (IndexingConstants.FIELD_MEDIA_TYPE_NEGATE.equals(field.getKey())) {
+                         // Get the value of resource mediaType negation
+                         mediaTypeNegate = field.getValue();
+                     } else if (IndexingConstants.FIELD_GROUP.equals(field.getKey())) {
+                         // Get the value of resource group
+                         group = field.getValue();
+                     } else if (IndexingConstants.FIELD_GROUP_NGROUPS.equals(field.getKey())) {
+                         // Get the value of resource group.ngroups
+                         groupNGroups = field.getValue();
+                     } else if (IndexingConstants.FIELD_GROUP_FORMAT.equals(field.getKey())) {
+                         // Get the value of resource group.format
+                         groupFormat = field.getValue();
+                     } else if (IndexingConstants.FIELD_GROUP_FIELD.equals(field.getKey())) {
+                         // Get the value of group.field
+                         groupField = field.getValue() + SolrConstants.SOLR_STRING_FIELD_KEY_SUFFIX;
+                     } else if (IndexingConstants.FIELD_GROUP_SORT.equals(field.getKey())) {
+                         // Get the value of group.sort
+                         String[] grpsort = field.getValue().split(" ");
+                         if (grpsort.length > 1) {
+                             groupSort = grpsort[0] + SolrConstants.SOLR_STRING_FIELD_KEY_SUFFIX + " "
+                                     + grpsort[1];
+                         } else if (grpsort.length > 0) {
+                             groupSort = grpsort[0] + SolrConstants.SOLR_STRING_FIELD_KEY_SUFFIX + " "
+                                     + SolrQuery.ORDER.desc;
+                         }
+                     } else if (IndexingConstants.FIELD_CREATED_BY.equals(field.getKey())) {
+                         // Get the value of resource author
+                         createdBy = field.getValue();
+                     } else if (IndexingConstants.FIELD_CREATED_BY_NEGATE.equals(field.getKey())) {
+                         // Get the value of resource author negation
+                         createdByNegate = field.getValue();
+                     } else if (IndexingConstants.FIELD_LAST_UPDATED_BY.equals(field.getKey())) {
+                         // Get the value of resource updater
+                         updatedBy = field.getValue();
+                     } else if (IndexingConstants.FIELD_UPDATE_BY_NEGATE.equals(field.getKey())) {
+                         // Get the value of resource updater negation
+                         updatedByNegate = field.getValue();
+                     } else if (IndexingConstants.FIELD_CREATED_RANGE_NEGATE.equals(field.getKey())) {
+                         // Get the value of created date range negate
+                         createdRangeNegate = field.getValue();
+                     } else if (IndexingConstants.FIELD_UPDATED_RANGE_NEGATE.equals(field.getKey())) {
+                         // Get the value of updated date range negate
+                         updatedRangeNegate = field.getValue();
+                     } else {
+                         // Set the suffix value of the key
+                         if (isMultiValueField(fields.get("mediaType"), field.getKey())) {
+                             fieldKeySuffix = SolrConstants.SOLR_MULTIVALUED_STRING_FIELD_KEY_SUFFIX + ":";
+                         } else {
+                             fieldKeySuffix = SolrConstants.SOLR_STRING_FIELD_KEY_SUFFIX + ":";
+                         }
+                         query.addFilterQuery(field.getKey() + fieldKeySuffix + (field.getValue()));
+                     }
+                 }
+             }
+             // Set query filter for mediaType
+             if (StringUtils.isNotEmpty(mediaType)) {
+                 // Set the value of the key
+                 String fieldKey = IndexingConstants.FIELD_MEDIA_TYPE + SolrConstants.SOLR_STRING_FIELD_KEY_SUFFIX + ":";
+                 setQueryFilterSingleValue(query, fieldKey, mediaType, mediaTypeNegate);
+             }
+             // Set query filter for author
+             if (StringUtils.isNotEmpty(createdBy)) {
+                 // Set the value of the key
+                 String fieldKey = IndexingConstants.FIELD_CREATED_BY + SolrConstants.SOLR_STRING_FIELD_KEY_SUFFIX + ":";
+                 String createdByValue = getWildcardSearchQueryValue(createdBy);
+                 setQueryFilterSingleValue(query, fieldKey, createdByValue, createdByNegate);
+             }
+             // Set query filter for group
+             if (StringUtils.isNotEmpty(group)) {
+                 // Set the value of the key
+                 addGroupingQuery(query, IndexingConstants.FIELD_GROUP, group);
+             }
+             // Set query filter for group.field
+             if (StringUtils.isNotEmpty(groupField)) {
+                 // Set the value of the key
+                 addGroupingQuery(query, IndexingConstants.FIELD_GROUP_FIELD, groupField);
+             }
+             // Set query filter for group.sort
+             if (StringUtils.isNotEmpty(groupSort)) {
+                 // Set the value of the key
+                 addGroupingQuery(query, IndexingConstants.FIELD_GROUP_SORT, groupSort);
+             }
+             // Set query filter for group.ngroups
+             if (StringUtils.isNotEmpty(groupNGroups)) {
+                 // Set the value of the key
+                 addGroupingQuery(query, IndexingConstants.FIELD_GROUP_NGROUPS, groupNGroups);
+             }
+             // Set query filter for group.ngroups
+             if (StringUtils.isNotEmpty(groupFormat)) {
+                 // Set the value of the key
+                 addGroupingQuery(query, IndexingConstants.FIELD_GROUP_FORMAT, groupFormat);
+             }
+             // Set query filter for updater
+             if (StringUtils.isNotEmpty(updatedBy)) {
+                 // Set the value of the key
+                 String fieldKey =
+                         IndexingConstants.FIELD_LAST_UPDATED_BY + SolrConstants.SOLR_STRING_FIELD_KEY_SUFFIX + ":";
+                 String updatedByValue = getWildcardSearchQueryValue(updatedBy);
+                 setQueryFilterSingleValue(query, fieldKey, updatedByValue, updatedByNegate);
+             }
+             // Set query filter for created date range
+             setQueryFilterDateRange(query, createdAfter, createdBefore, createdRangeNegate,
+                     IndexingConstants.FIELD_CREATED_DATE);
+             // Set query filter for updated date range
+             setQueryFilterDateRange(query, updatedAfter, updatedBefore, updatedRangeNegate,
+                     IndexingConstants.FIELD_LAST_UPDATED_DATE);
+             // Set query filter for property
+             setQueryFilterProperty(query, propertyName, leftPropertyValue, leftOp, rightPropertyValue, rightOp);
+             // Set query filter for resource name
+             setQueryFilterResourceName(query, resourceName);
+         }
+     }
+ 
+     /**
+      * Method to add the query filter for single fields (resource author, resource last updater, resource media type)
+      * @param fieldValue resource value
+      * @param query solr query
+      * @param fieldNegate resource negation
+      */
+     private void setQueryFilterSingleValue(SolrQuery query, String fieldKey, String fieldValue, String fieldNegate) {
+         String fieldQuery;
+         if (StringUtils.isNotEmpty(fieldNegate) && fieldNegate.equalsIgnoreCase(
+                 SolrConstants.NEGATE_VALUE_DEFAULT)) {
+             fieldQuery = fieldKey + SolrConstants.SOLR_NEGATE_VALUE + fieldKey + fieldValue;
+         } else {
+             fieldQuery = fieldKey + fieldValue;
+         }
+         query.addFilterQuery(fieldQuery);
+     }
+ 
+     /**
+      * Method to add the query filter for resource name
+      * @param resourceName resource name
+      * @param query solr query
+      */
+     private void setQueryFilterResourceName(SolrQuery query, String resourceName) {
+         if (StringUtils.isNotEmpty(resourceName)) {
+             String fieldKeySuffix = SolrConstants.SOLR_STRING_FIELD_KEY_SUFFIX + ":";
+             String resourceNameValue = getWildcardSearchQueryValue(resourceName);
+             query.addFilterQuery(IndexingConstants.FIELD_RESOURCE_NAME + fieldKeySuffix + resourceNameValue);
+         }
+     }
+ 
+     /**
+      * Method to add the query filter for resource property values
+      * @param propertyName name of the property (property key)
+      * @param leftPropertyValue left property value
+      * @param leftOp left operation
+      * @param rightPropertyValue right property value
+      * @param rightOp right operation
+      * @param query solr query
+      */
+     private void setQueryFilterProperty(SolrQuery query, String propertyName, String leftPropertyValue, String leftOp,
+             String rightPropertyValue, String rightOp) {
+         if (StringUtils.isNotEmpty(propertyName)) {
+ 
+             if (leftPropertyValue != null && rightPropertyValue != null || rightOp
+                     .equals(SolrConstants.OPERATION_EQUAL)) {
+                 String rightValueType, leftValueType;
+                 int rightIntValue = 0;
+                 double rightDoubleValue = 0;
+                 // No operation values only check the property name
+                 if (StringUtils.isEmpty(leftPropertyValue) && StringUtils.isEmpty(rightPropertyValue)) {
+                     String fieldKeyInt = propertyName + SolrConstants.SOLR_MULTIVALUED_INT_FIELD_KEY_SUFFIX + ":";
+                     String fieldKeyDouble = propertyName + SolrConstants.SOLR_MULTIVALUED_DOUBLE_FIELD_KEY_SUFFIX + ":";
+                     String fieldKeyString = propertyName + SolrConstants.SOLR_MULTIVALUED_STRING_FIELD_KEY_SUFFIX + ":";
+                     query.addFilterQuery(fieldKeyInt + "* | " + fieldKeyDouble + "* | " + fieldKeyString + "*");
+                 }
+                 // check foe equal operation
+                 if (rightOp.equals(SolrConstants.OPERATION_EQUAL) && StringUtils.isNotEmpty(rightPropertyValue)) {
+                     setQueryFilterPropertyEqualOperation(query, propertyName, rightPropertyValue);
+                 } else {
+                     rightValueType = getType(rightPropertyValue);
+                     leftValueType = getType(leftPropertyValue);
+                     if (rightValueType.equals(SolrConstants.TYPE_INT)) {
+                         rightIntValue = Integer.parseInt(rightPropertyValue);
+                         if (rightOp.equals(SolrConstants.OPERATION_LESS_THAN)) {
+                             --rightIntValue;
+                         }
+                     } else if (rightValueType.equals(SolrConstants.TYPE_DOUBLE)) {
+                         rightDoubleValue = Double.parseDouble(rightPropertyValue);
+                         if (rightOp.equals(SolrConstants.OPERATION_LESS_THAN)) {
+                             rightDoubleValue = rightDoubleValue - 0.1;
+                         }
+                     }
+                     if (rightValueType.equals(SolrConstants.TYPE_INT) || leftValueType.equals(SolrConstants.TYPE_INT)) {
+                         setQueryFilterForIntegerPropertyValues(query, propertyName, leftPropertyValue,
+                                 rightPropertyValue, rightIntValue,
+                                 leftOp, rightOp);
+                     } else if (rightValueType.equals(SolrConstants.TYPE_DOUBLE) || leftValueType
+                             .equals(SolrConstants.TYPE_DOUBLE)) {
+                         setQueryFilterForDoublePropertyValues(query, propertyName, leftPropertyValue,
+                                 rightPropertyValue, rightDoubleValue,
+                                 leftOp, rightOp);
+                     }
+                 }
+             }
+         }
+     }
+ 
+     /**
+      * Method for set query filter for property search integer property values
+      * @param leftPropertyValue left property value
+      * @param rightPropertyValue right property value
+      * @param rightDoubleValue right double value
+      * @param leftOp left operation
+      * @param rightOp right operation
+      * @param query solr query
+      * @param propertyName name of the property (property key)
+      */
+     private void setQueryFilterForDoublePropertyValues(SolrQuery query, String propertyName, String leftPropertyValue,
+             String rightPropertyValue,
+             double rightDoubleValue, String leftOp, String rightOp) {
+         // Get the double values
+         double leftDoubleValue = 0;
+         if (StringUtils.isNotEmpty(leftPropertyValue)) {
+             leftDoubleValue = Double.parseDouble(leftPropertyValue);
+         }
+         String fieldKey = propertyName + SolrConstants.SOLR_MULTIVALUED_DOUBLE_FIELD_KEY_SUFFIX + ":";
+         if (leftOp.equals(SolrConstants.OPERATION_GREATER_THAN) || leftOp
+                 .equals(SolrConstants.OPERATION_GREATER_THAN_OR_EQUAL)
+                 || leftOp.equals(SolrConstants.OPERATION_NA)) {
+             // If operation is greater than add .1
+             if (leftOp.equals(SolrConstants.OPERATION_GREATER_THAN)) {
+                 leftDoubleValue = leftDoubleValue + 0.1;
+             }
+ 
+             if ((rightOp.equals(SolrConstants.OPERATION_NA) || StringUtils.isEmpty(rightPropertyValue)) && StringUtils
+                     .isNotEmpty(leftPropertyValue)) {
+                 query.addFilterQuery(fieldKey + "[" + leftDoubleValue + " TO * ]");
+             } else if (StringUtils.isNotEmpty(rightPropertyValue) && StringUtils
+                     .isNotEmpty(leftPropertyValue)) {
+                 query.addFilterQuery(
+                         fieldKey + "[" + leftDoubleValue + " TO " + rightDoubleValue + "]");
+             } else if ((leftOp.equals(SolrConstants.OPERATION_NA) || StringUtils.isEmpty(leftPropertyValue))
+                     && StringUtils
+                     .isNotEmpty(rightPropertyValue)) {
+                 query.addFilterQuery(fieldKey + "[ * TO " + rightDoubleValue + "]");
+             }
+         }
+     }
+ 
+     /**
+      * Method for set query filter for property search integer property values
+      * @param leftPropertyValue left property value
+      * @param rightPropertyValue right property value
+      * @param rightIntValue right int value
+      * @param leftOp left operation
+      * @param rightOp right operation
+      * @param query solr query
+      * @param propertyName value for the property name
+      */
+     private void setQueryFilterForIntegerPropertyValues(SolrQuery query, String propertyName, String leftPropertyValue,
+             String rightPropertyValue,
+             int rightIntValue, String leftOp, String rightOp) {
+         int leftIntValue = 0;
+         // Get the integer values
+         if (StringUtils.isNotEmpty(leftPropertyValue)) {
+             leftIntValue = Integer.parseInt(leftPropertyValue);
+         }
+         String fieldKey = propertyName + SolrConstants.SOLR_MULTIVALUED_INT_FIELD_KEY_SUFFIX + ":";
+         if (leftOp.equals(SolrConstants.OPERATION_GREATER_THAN) || leftOp
+                 .equals(SolrConstants.OPERATION_GREATER_THAN_OR_EQUAL)
+                 || leftOp.equals(SolrConstants.OPERATION_NA)) {
+ 
+             // If operation is greater than add 1
+             if (leftOp.equals(SolrConstants.OPERATION_GREATER_THAN)) {
+                 ++leftIntValue;
+             }
+ 
+             if ((rightOp.equals(SolrConstants.OPERATION_NA) || StringUtils.isEmpty(rightPropertyValue)) && StringUtils
+                     .isNotEmpty(leftPropertyValue)) {
+                 query.addFilterQuery(fieldKey + "[" + leftIntValue + " TO * ]");
+             } else if (StringUtils.isNotEmpty(rightPropertyValue) && StringUtils
+                     .isNotEmpty(leftPropertyValue)) {
+                 query.addFilterQuery(fieldKey + "[" + leftIntValue + " TO " + rightIntValue + "]");
+             } else if ((leftOp.equals(SolrConstants.OPERATION_NA) || StringUtils.isEmpty(leftPropertyValue))
+                     && StringUtils
+                     .isNotEmpty(
+                             rightPropertyValue)) {
+                 query.addFilterQuery(fieldKey + "[ * TO " + rightIntValue + "]");
+             }
+         }
+     }
+ 
+     /**
+      * Method to add query filter for Property search equal operation
+      * @param rightPropertyValue right field property value
+      * @param query solr query
+      * @param propertyName value for the property name
+      */
+     private void setQueryFilterPropertyEqualOperation(SolrQuery query, String propertyName, String rightPropertyValue) {
+         String valueType = getType(rightPropertyValue);
+         String fieldKey;
+         if (valueType.equals(SolrConstants.TYPE_INT)) {
+             // Get the integer value
+             int intValue = Integer.parseInt(rightPropertyValue);
+             fieldKey = propertyName + SolrConstants.SOLR_MULTIVALUED_INT_FIELD_KEY_SUFFIX + ":";
+             query.addFilterQuery(fieldKey + intValue);
+         } else if (valueType.equals(SolrConstants.TYPE_DOUBLE)) {
+             // Get the float value
+             double doubleValue = Double.parseDouble(rightPropertyValue);
+             fieldKey = propertyName + SolrConstants.SOLR_MULTIVALUED_DOUBLE_FIELD_KEY_SUFFIX + ":";
+             query.addFilterQuery(fieldKey + doubleValue);
+         } else if (valueType.equals(SolrConstants.TYPE_STRING)) {
+             // Get the string value
+             rightPropertyValue = getWildcardSearchQueryValue(rightPropertyValue);
+             fieldKey = propertyName + SolrConstants.SOLR_MULTIVALUED_STRING_FIELD_KEY_SUFFIX + ":";
+             query.addFilterQuery(fieldKey + rightPropertyValue);
+         }
+     }
+ 
+     /**
+      * Method to add the query filter for date ranges
+      * @param dateAfter create after date
+      * @param dateBefore create before date
+      * @param dateRangeNegate negate value
+      * @param query solr query
+      */
+     private void setQueryFilterDateRange(SolrQuery query, String dateAfter, String dateBefore, String dateRangeNegate,
+             String fieldKeyName) {
+         String dateRangeQuery;
+         // Set the suffix value of the key
+         String fieldKeySuffix = SolrConstants.SOLR_DATE_FIELD_KEY_SUFFIX + ":[";
+         if (StringUtils.isNotEmpty(dateAfter) && StringUtils.isNotEmpty(dateBefore)) {
+             if (StringUtils.isNotEmpty(dateRangeNegate) && dateRangeNegate.equalsIgnoreCase(
+                     SolrConstants.NEGATE_VALUE_DEFAULT)) {
+                 dateRangeQuery =
+                         "(NOT " + fieldKeyName + fieldKeySuffix + toSolrDateFormat(dateAfter,
+                                 SolrConstants.CALENDER_DATE_FORMAT)
+                                 + " TO " + toSolrDateFormat(dateBefore,
+                                 SolrConstants.CALENDER_DATE_FORMAT) + "])";
+             } else {
+                 dateRangeQuery =
+                         fieldKeyName + fieldKeySuffix + toSolrDateFormat(dateAfter,
+                                 SolrConstants.CALENDER_DATE_FORMAT) + " TO " + toSolrDateFormat(dateBefore,
+                                 SolrConstants.CALENDER_DATE_FORMAT) + "]";
+             }
+             query.addFilterQuery(dateRangeQuery);
+         } else if (StringUtils.isNotEmpty(dateAfter)) {
+             if (StringUtils.isNotEmpty(dateRangeNegate) && dateRangeNegate
+                     .equalsIgnoreCase(
+                             SolrConstants.NEGATE_VALUE_DEFAULT)) {
+                 dateRangeQuery = "(NOT " + fieldKeyName + fieldKeySuffix + toSolrDateFormat(dateAfter,
+                         SolrConstants.CALENDER_DATE_FORMAT) + " TO NOW])";
+             } else {
+                 dateRangeQuery =
+                         fieldKeyName + fieldKeySuffix + toSolrDateFormat(dateAfter, SolrConstants.CALENDER_DATE_FORMAT)
+                                 + " TO NOW]";
+             }
+             query.addFilterQuery(dateRangeQuery);
+         } else if (StringUtils.isNotEmpty(dateBefore)) {
+             if (StringUtils.isNotEmpty(dateRangeNegate) && dateRangeNegate
+                     .equalsIgnoreCase(
+                             SolrConstants.NEGATE_VALUE_DEFAULT)) {
+                 dateRangeQuery =
+                         fieldKeyName + fieldKeySuffix + toSolrDateFormat(dateBefore, SolrConstants.CALENDER_DATE_FORMAT)
+                                 + " TO NOW]";
+             } else {
+                 dateRangeQuery =
+                         "(NOT " + fieldKeyName + fieldKeySuffix + toSolrDateFormat(dateBefore,
+                                 SolrConstants.CALENDER_DATE_FORMAT)
+                                 + " TO NOW])";
+             }
+             query.addFilterQuery(dateRangeQuery);
+         }
+     }
+ 
+     /**
+      * Method to get the solr query value need for wildcard search
+      * @param fieldValue property field value
+      * @return result value
+      */
+     private String getWildcardSearchQueryValue(String fieldValue) {
+         String result;
+         char lastCharacter = fieldValue.charAt(fieldValue.length() - 1);
+         char firstCharacter = fieldValue.charAt(0);
+         if (lastCharacter == '%' && firstCharacter == '%') {
+             result = "*" + fieldValue.substring(1, fieldValue.length() - 1) + "*";
+         } else if (lastCharacter == '%') {
+             result = fieldValue.substring(0, fieldValue.length() - 1) + "*";
+         } else if (firstCharacter == '%') {
+             result = "*" + fieldValue.substring(1, fieldValue.length());
+         } else {
+             result = fieldValue;
+         }
+         return result;
+     }
+ 
+     @Deprecated
+     public void cleanAllDocuments() {
+         try {
+             QueryResponse results = server.query(new SolrQuery("ICWS"));
+             SolrDocumentList resultsList = results.getResults();
+ 
+             for (SolrDocument aResultsList : resultsList) {
+                 String id = (String) aResultsList.getFieldValue(
+                         IndexingConstants.FIELD_ID);
+                 UpdateResponse deleteById = server.deleteById(id);
+                 if (log.isDebugEnabled()) {
+                     log.debug("Deleted ID " + id + " Status " + deleteById.getStatus());
+                 }
+             }
+         } catch (SolrServerException e) {
+             //throw unchecked exception: SolrException, this will throw when there is an error in connection.
+             throw new SolrException(ErrorCode.SERVER_ERROR, e);
+         } catch (IOException e) {
+             //throw unchecked exception: SolrException, this will throw when there is an error in connection.
+             throw new SolrException(ErrorCode.SERVER_ERROR, e);
+         }
+     }
+ 
+     /**
+      * Method returns username of the logged in user
+      * @return username of logged in user
+      */
+     private static String getLoggedInUserName(){
+         return PrivilegedCarbonContext.getThreadLocalCarbonContext().getUsername();
+     }
+ 
+     private String removeSpecialCharacters(String dateValue){
+         if (dateValue.startsWith("*")){
+             dateValue =  dateValue.substring(1,dateValue.length());
+         }
+         if(dateValue.endsWith("*")){
+             dateValue = dateValue.substring(0,dateValue.length()-1);
+         }
+         return dateValue;
+     }
+ 
+     /**
+      * This method is used to check whether a filed is a multi value filed or not.
+      *
+      * @param mediaType media type
+      * @param fieldKey  field key
+      * @return
+      */
+     private boolean isMultiValueField(String mediaType, String fieldKey) {
+         boolean result = false;
+         Map<Integer, Map<String, List<String>>> allTenantsUnboundedFields = RxtUnboundedFieldManagerService
+                 .getInstance().getTenantsUnboundedFields();
+ 
+         if (allTenantsUnboundedFields.size() > 0) {
+             Map<String, List<String>> rxtDetails = allTenantsUnboundedFields.get(PrivilegedCarbonContext
+                     .getThreadLocalCarbonContext().getTenantId());
+             if (rxtDetails != null) {
+                 List<String> fields = rxtDetails.get(mediaType);
+                 if (fields != null) {
+                     if (fields.contains(fieldKey)) {
+                         result = true;
+                     }
+                 }
+             }
+         }
+         return result;
+     }
+ }
